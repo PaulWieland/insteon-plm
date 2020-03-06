@@ -904,14 +904,23 @@ export default class PowerLincModem extends EventEmitter2 {
 
 	/**
 	 * Factory method for creating a device instance of the correct type
-	 * e.g. user inputs aa.bb.cc, modem queries the device and finds out it's a dimmer
-	 * thus returns an instance of a DimmableLightingDevice
+	 * e.g. user inputs aa.bb.cc, we look at the modem's control link for the device
+	 * the link info tells us the cat, subcat and firmware
+	 * thus returns an instance of the correct device type (DimmableLightingDevice = cat:0x01)
 	 **/
 	public async getDeviceInstance(deviceID: Byte[], options?: DeviceOptions){
-		let info = await this.queryDeviceInfo(deviceID, options);
-		switch(Number(info.cat)){
+		let link = this.links.find(l => toAddressString(l.device) === toAddressString(deviceID) && l.type === AllLinkRecordType.Controller);
+
+		if(!link){
+			throw Error(`Control link for device ${toAddressString(deviceID)} not found.`);
+		}
+
+		let info = PowerLincModem.getDeviceInfo(link.linkData[0],link.linkData[1],link.linkData[2]);
+
+		// let info = await this.queryDeviceInfo(deviceID, options);
+		switch(Number(info?.cat)){
 			case 0x01:
-				switch(Number(info.subcat)){
+				switch(Number(info?.subcat)){
 					case 0x1C: return new KeypadDimmer(deviceID, this, options);
 					default: return new DimmableLightingDevice(deviceID, this, options);
 				}
@@ -919,13 +928,13 @@ export default class PowerLincModem extends EventEmitter2 {
 			case 0x02: return new SwitchedLightingDevice(deviceID, this, options);
 
 			case 0x07:
-				switch(Number(info.subcat)){
+				switch(Number(info?.subcat)){
 					case 0x00: return new IOLinc(deviceID, this, options);
 					default: return new SensorActuatorDevice(deviceID, this, options);
 				}
 
 			case 0x10:
-				switch(Number(info.subcat)){
+				switch(Number(info?.subcat)){
 					case 0x01:
 					case 0x03:
 					case 0x04:
