@@ -3,8 +3,8 @@ import { delay } from 'bluebird';
 import { EventEmitter2 } from 'eventemitter2';
 import { Byte, PacketID, Packet, MessageSubtype, AllLinkRecordType } from 'insteon-packet-parser'
 import PowerLincModem from '../PowerLincModem';
-import { Device } from '../typings/database';
 import { toHex, toAddressString } from '../utils';
+import { Device } from '../typings/Device';
 //#endregion
 
 //#region Interfaces
@@ -19,7 +19,7 @@ export interface DeviceInfo {
 	cat: Byte;
 	subcat: Byte;
 	firmware: Byte;
-	hardward: Byte;
+	hardware: Byte;
 }
 export interface DeviceOptions {
 	debug: boolean;
@@ -72,7 +72,7 @@ export default class InsteonDevice extends EventEmitter2 {
 	public cat: Byte = 0x00;
 	public subcat: Byte = 0x00;
 	public firmware: Byte = 0x00;
-	public hardward: Byte = 0x00;
+	public hardware: Byte = 0x00;
 	public links: DeviceLinkRecord[] = [];
 
 	/* Inernal Variables */
@@ -189,7 +189,7 @@ export default class InsteonDevice extends EventEmitter2 {
 		this.cat = info.cat;
 		this.subcat = info.subcat;
 		this.firmware = info.firmware;
-		this.hardward = info.hardward;
+		this.hardware = info.hardware;
 
 		// Returning device info
 		return info;
@@ -209,7 +209,10 @@ export default class InsteonDevice extends EventEmitter2 {
 
 	// Reading entire database
 	public getDatabase = () =>
-		this.readDatabase([0x0F, 0xFF], 0x00);
+	{
+		// TODO: Need to get one record at a time and look for ending record
+		return this.readDatabase([0x0F, 0xFF], 0x00);
+	}
 
 	// Get device info and parse info out of packet
 	public async getDeviceInfo(){
@@ -220,10 +223,16 @@ export default class InsteonDevice extends EventEmitter2 {
 			cat: data.to[0],
 			subcat: data.to[1],
 			firmware: data.to[2],
-			hardward: data.cmd2
+			hardware: data.cmd2
 		};
 
 		return deviceInfo;
+	}
+
+	public async getFullDeviceInfo(){
+		const info = await this.getDeviceInfo();
+
+		return PowerLincModem.getFullDeviceInfo(info.cat, info.subcat, info.firmware);
 	}
 
 	public clearDatabaseRecord(address: Byte[], highwater: boolean = false){
@@ -375,7 +384,7 @@ export default class InsteonDevice extends EventEmitter2 {
 			};
 
 			// If link is a highwater mark then remove listener and fullfil promise, else add link to cache
-			if(link.Type.highWater){
+			if((numberOfRecords !== 0 && links.length - 1 === numberOfRecords) || link.Type.highWater){
 				this.removeListener(dbRecordEvent, handleDbRecordResponse);
 
 				links.push(link);
