@@ -7,31 +7,14 @@ import { InsteonParser, Packet } from 'insteon-packet-parser';
 import { toHex, toAddressString } from './utils';
 import deviceDB from './deviceDB.json';
 import Bluebird, { delay, promisify } from 'bluebird';
+import { Device } from './typings/Device';
 
 /* Generic Insteon Device */
-import InsteonDevice, { DeviceOptions } from './devices/InsteonDevice';
-
-/* Dimable Devices. Device cat 0x01 */
-import DimmableLightingDevice from './devices/DimmableLightingDevice/DimmableLightingDevice';
-import KeypadDimmer from './devices/DimmableLightingDevice/KeypadDimmer';
-
-/* Switched On/Off Devices. Device cat 0x02 */
-import SwitchedLightingDevice from './devices/SwitchedLightingDevice/SwitchedLightingDevice';
-import OutletLinc from './devices/SwitchedLightingDevice/OutletLinc';
-
-/* Sensors and Actuators. Device cat 0x07 */
-import SensorActuatorDevice from './devices/SensorActuatorDevice/SensorActuatorDevice';
-import IOLinc from './devices/SensorActuatorDevice/IOLinc';
-
-/* Security / battery operated sensors. Device cat 0x10 */
-import SecurityDevice from './devices/SecurityDevice/SecurityDevice';
-import MotionSensor from './devices/SecurityDevice/MotionSensor';
-import OpenCloseSensor from './devices/SecurityDevice/OpenCloseSensor';
-import LeakSensor from './devices/SecurityDevice/LeakSensor';
+import InsteonDevice, { DeviceOptions, DeviceInfo } from './devices/InsteonDevice';
 
 /* Interfaces and Types */
 import { PacketID, Byte, AllLinkRecordOperation, AllLinkRecordType, AnyPacket, MessageSubtype } from 'insteon-packet-parser';
-import { Device } from './typings/database';
+import { Utilities } from './main';
 
 //#endregion
 
@@ -41,7 +24,10 @@ const debug = logger('insteon-plm:powerLincModem');
 
 //#region Interfaces
 export interface ModemOptions {
-	debug: boolean;
+	debug?: boolean;
+	syncInfo?: boolean;
+	syncConfig?: boolean;
+	syncLinks?: boolean;
 }
 
 export interface ModemInfo{
@@ -49,6 +35,13 @@ export interface ModemInfo{
 	devcat: Byte;
 	subcat: Byte;
 	firmware: Byte;
+}
+
+export interface FoundModemDevice{
+	port: string;
+	id?: Byte[];
+	info?: ModemInfo;
+	error?: string;
 }
 
 export interface ModemConfig{
@@ -99,7 +92,7 @@ export default class PowerLincModem extends EventEmitter2 {
 	private parser: InsteonParser;
 
 	/* Debug */
-	private options: ModemOptions = { debug: false };
+	private options?: ModemOptions;
 
 	//#endregion
 
@@ -116,8 +109,12 @@ export default class PowerLincModem extends EventEmitter2 {
 		super({ wildcard: true, delimiter: '::' });
 
 		/* Saving options */
-		if(options)
+		if(options){
 			this.options = options;
+
+			if(this.options.debug)
+				debug.enabled = this.options.debug;
+		}
 
 		/* Opening serial port */
 		this.port = new SerialPort(portPath, {
@@ -135,7 +132,7 @@ export default class PowerLincModem extends EventEmitter2 {
 		this.port.pipe(this.parser);
 
 		/* Waiting for serial port to open */
-		this.port.on('open', this.handlePortOpen);
+		this.port.on('open', _ => this.handlePortOpen(options));
 		this.port.on('error', this.handlePortError);
 		this.port.on('close', this.handlePortClose);
 
@@ -738,7 +735,12 @@ export default class PowerLincModem extends EventEmitter2 {
 
 			// Waiting 500 ms for modem to be ready
 			this.requestQueue.pause();
-			setTimeout(_ => this.requestQueue.resume(), 200);
+			debug('[!]: Paused queue');
+
+			setTimeout(_ => {
+				debug('[!]: Resuming queue');
+				this.requestQueue.resume();
+			}, 500);
 
 			packet.Flags.subtype === MessageSubtype.ACKofDirectMessage ? callback(null, packet) : callback(Error(packet.Flags.Subtype), packet);
 		}
@@ -746,7 +748,7 @@ export default class PowerLincModem extends EventEmitter2 {
 		const onSceneCleanupPacket = (packet: Packet.AllLinkCleanupStatusReport) => {
 			clearTimeout(timer);
 
-			callback(null, packet)
+			callback(null, packet);
 		}
 
 		const onNetworkTimeout = () => {
@@ -788,7 +790,7 @@ export default class PowerLincModem extends EventEmitter2 {
 
 	//#region Port Handlers
 
-	private handlePortOpen = async () => {
+	private handlePortOpen = async (options?: ModemOptions) => {
 		/* Updating connected */
 		this.connected = true;
 
@@ -797,9 +799,21 @@ export default class PowerLincModem extends EventEmitter2 {
 		this.emit(['e', 'connected']);
 
 		/* Inital Sync of info */
-		await this.syncInfo();
-		await this.syncConfig();
-		await this.syncLinks();
+		try{
+			if(options?.syncInfo ?? true)
+				await this.syncInfo();
+
+			if(options?.syncConfig ?? true)
+				await this.syncConfig();
+
+			if(options?.syncLinks ?? true)
+				await this.syncLinks();
+		}
+		catch(error){
+			this.emit('error', error);
+			this.emit(['e', 'error'], error);
+			return;
+		}
 
 		/* Emitting ready */
 		this.emit('ready');
@@ -833,7 +847,7 @@ export default class PowerLincModem extends EventEmitter2 {
 		/* Emitting packet for others to use */
 		this.emit('packet', packet);
 
-		if(this.options.debug){
+		if(this.options?.debug){
 			if(packet.type === PacketID.SendInsteonMessage){
 				const p = packet as Packet.SendInsteonMessage;
 				debug(`[→][${toAddressString(p.to)}][${(p.flags & 0x10) == 16 ? 'E' : 'S'}][${p.Type}]: ${toHex(p.cmd1)} ${toHex(p.cmd2)} ${p.extendedData? p.extendedData.map(toHex) : ''}`);
@@ -864,17 +878,57 @@ export default class PowerLincModem extends EventEmitter2 {
 
 	//#region Static Methods
 
-	public static async getPlmDevices(){
+	public static async getPlmPorts(){
 		const devices = await SerialPort.list();
 
 		return devices.filter(d => d.vendorId === '0403' && d.productId === '6001');
 	}
 
-	public static getDeviceInfo = (cat: Byte, subcat: Byte, firmware: Byte): Device | undefined => {
+	public static getPlmDevices(): Promise<FoundModemDevice[]>{
+		return new Promise(async (resolve, reject) => {
+
+			const ports = await this.getPlmPorts();
+
+			const promises = ports.map((p) => {
+				return new Promise((res, rej) => {
+
+					const plm = new PowerLincModem(p.path, {syncConfig: false, syncLinks: false});
+
+					plm.on('ready', () => {
+						res({
+							id: plm.info.id,
+							path: p.path,
+							info: PowerLincModem.getFullDeviceInfo(plm.info.devcat, plm.info.subcat, plm.info.firmware)
+						});
+
+						plm.close();
+					});
+
+					plm.on('error', (e: Error) => {
+						res({
+							path: p.path,
+							error: e.message,
+						});
+
+						plm.close();
+					});
+
+				});
+			});
+
+			const devices = await Promise.all(promises) as FoundModemDevice[];
+
+			resolve(devices);
+		});
+	}
+
+	public static getFullDeviceInfo = (cat: Byte, subcat: Byte, firmware: Byte): Device | undefined => {
 		let info = deviceDB.devices.find(d => Number(d.cat) === cat && Number(d.subcat) === subcat) as Device;
+
 		if(info !== undefined){
 			info.firmware = `0x${firmware.toString(16).toUpperCase()}`;
 		}
+
 		return info;
 	}
 
@@ -883,78 +937,47 @@ export default class PowerLincModem extends EventEmitter2 {
 	//#region Device Methods
 
 	/* Send an insteon command from the modem to a device to find out what it is */
-	public queryDeviceInfo = (deviceID: Byte[], options?: DeviceOptions) => new Bluebird<Device>((resolve, reject) => {
-		// We got cached device info, no need to query the device.
-		if(options?.cache){
-			resolve(options?.cache.info);
-			return;
-		}
-
+	public queryDeviceInfo = (deviceID: Byte[]) => new Bluebird<DeviceInfo>((resolve, reject) => {
 		// Catching broadcast message
 		this.once(
 			['p', PacketID.StandardMessageReceived.toString(16), MessageSubtype.BroadcastMessage.toString(16), toAddressString(deviceID)],
-			(data: Packet.StandardMessageRecieved) =>
-				resolve(PowerLincModem.getDeviceInfo(data.to[0],data.to[1],data.to[2]))
+			(data: Packet.StandardMessageRecieved) => {
+				const deviceInfo: DeviceInfo = {
+					cat: data.to[0],
+					subcat: data.to[1],
+					firmware: data.to[2],
+					hardware: data.cmd2
+				}
+
+				resolve(deviceInfo);
+			}
 		);
 
 		debug(`queryDeviceInfo: ${toAddressString(deviceID)}`);
 		this.sendStandardCommand(deviceID, 0x10, 0x00);
-	}).timeout(2000);
+	});
+
+	public async queryFullDeviceInfo(deviceID: Byte[]){
+		const info = await this.queryDeviceInfo(deviceID);
+
+		return PowerLincModem.getFullDeviceInfo(info.cat, info.subcat, info.firmware);
+	}
 
 
 	/**
 	 * Factory method for creating a device instance of the correct type
-	 * e.g. user inputs aa.bb.cc, we look at the modem's control link for the device
-	 * the link info tells us the cat, subcat and firmware
-	 * thus returns an instance of the correct device type (DimmableLightingDevice = cat:0x01)
+	 * e.g. user inputs aa.bb.cc, modem queries the device and finds out it's a dimmer
+	 * thus returns an instance of a DimmableLightingDevice
 	 **/
 	public async getDeviceInstance(deviceID: Byte[], options?: DeviceOptions){
-		let link = this.links.find(l => toAddressString(l.device) === toAddressString(deviceID) && l.type === AllLinkRecordType.Controller);
+		const info = await this.queryDeviceInfo(deviceID);
 
-		if(!link){
-			throw Error(`Control link for device ${toAddressString(deviceID)} not found.`);
-		}
+		const DeviceClass = await Utilities.getDeviceClass(info.cat, info.subcat);
 
-		let info = PowerLincModem.getDeviceInfo(link.linkData[0],link.linkData[1],link.linkData[2]);
+		if(DeviceClass == null)
+			throw new Error('Device does not have class map');
 
-		// let info = await this.queryDeviceInfo(deviceID, options);
-		switch(Number(info?.cat)){
-			case 0x01:
-				switch(Number(info?.subcat)){
-					case 0x1C: return new KeypadDimmer(deviceID, this, options);
-					default: return new DimmableLightingDevice(deviceID, this, options);
-				}
-
-			case 0x02: return new SwitchedLightingDevice(deviceID, this, options);
-
-			case 0x07:
-				switch(Number(info?.subcat)){
-					case 0x00: return new IOLinc(deviceID, this, options);
-					default: return new SensorActuatorDevice(deviceID, this, options);
-				}
-
-			case 0x10:
-				switch(Number(info?.subcat)){
-					case 0x01:
-					case 0x03:
-					case 0x04:
-					case 0x05: return new MotionSensor(deviceID, this, options);
-
-					case 0x02:
-					case 0x06:
-					case 0x07:
-					case 0x09:
-					case 0x11:
-					case 0x14:
-					case 0x015: return new OpenCloseSensor(deviceID, this, options);
-
-					case 0x08: return new LeakSensor(deviceID, this, options);
-
-					default: return new SecurityDevice(deviceID, this, options);
-				}
-
-			default: return new InsteonDevice(deviceID, this, options);
-		}
+		return new DeviceClass(deviceID, this, options);
 	}
 
 	//#endregion
